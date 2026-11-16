@@ -1,10 +1,12 @@
+import hmac
 import logging
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import config, db, embedding, llm, pdf, pptx_reader, service
@@ -21,25 +23,46 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Native RAG (pgvector, Gemini embeddings)", lifespan=lifespan)
+# No /docs, /redoc or /openapi.json: they would describe the API to anyone who can reach the port, without a key.
+app = FastAPI(title="Native RAG (pgvector, Gemini embeddings)", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def require_key(x_api_key: str = Header(default="")):
-    if not config.SERVICE_API_KEY or x_api_key != config.SERVICE_API_KEY:
+    # compare_digest takes the same time wherever the strings differ, so the key cannot be guessed from timings.
+    if not config.SERVICE_API_KEY or not hmac.compare_digest(x_api_key.encode(), config.SERVICE_API_KEY.encode()):
         raise HTTPException(401, "Invalid or missing X-API-Key")
 
 
+@app.middleware("http")
+async def limit_upload_size(request: Request, call_next):
+    """Refuses an oversized upload from its Content-Length, before the body is read and spooled to disk."""
+    if request.method == "POST" and request.url.path == "/index/file":
+        length = request.headers.get("content-length")
+        if not length:
+            return JSONResponse({"detail": "Content-Length is required"}, status_code=411)
+        if not length.isdigit() or int(length) > config.MAX_UPLOAD_MB * 1024 * 1024:
+            return JSONResponse({"detail": f"The file is larger than {config.MAX_UPLOAD_MB} MB"}, status_code=413)
+    return await call_next(request)
+
+
 class Turn(BaseModel):
-    question: str
-    answer: str
+    question: str = Field(max_length=config.MAX_QUESTION_CHARS)
+    answer: str = Field(max_length=config.MAX_QUESTION_CHARS)
 
 
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=1, max_length=config.MAX_QUESTION_CHARS)
     course_id: str
     mode: str | None = None  # accepted for API parity with the LightRAG service; ignored here
     history: list[Turn] = Field(default=[], max_length=10)  # earlier exchanges, oldest first (follow-up questions)
     instructions: str = Field(default="", max_length=4000)  # answer format/tone, not used for the search
+    summary: str = Field(default="", max_length=2 * config.SUMMARY_MAX_CHARS)  # older part of the chat, from /summarize
+
+
+class SummarizeRequest(BaseModel):
+    summary: str = Field(default="", max_length=2 * config.SUMMARY_MAX_CHARS)  # the running summary so far
+    turns: list[Turn] = Field(min_length=1, max_length=20)  # exchanges to fold in, oldest first
 
 
 @app.get("/health")
@@ -84,7 +107,20 @@ def index_file(
 @app.post("/query", dependencies=[Depends(require_key)])
 def query(req: AskRequest):
     history = [(t.question, t.answer) for t in req.history]
-    return service.answer(req.course_id, req.question, history, req.instructions)
+    try:
+        return service.answer(req.course_id, req.question, history, req.instructions, req.summary)
+    except llm.ModelUnavailable as e:
+        raise HTTPException(503, f"{e}. Please try again in a moment.")
+
+
+@app.post("/summarize", dependencies=[Depends(require_key)])
+def summarize(req: SummarizeRequest):
+    """Folds older exchanges of a chat into its running summary, so a client can keep the whole chat in memory while
+    sending only the summary plus the last few exchanges with each question."""
+    try:
+        return {"summary": llm.summarize(req.summary, [(t.question, t.answer) for t in req.turns])}
+    except llm.ModelUnavailable as e:
+        raise HTTPException(503, f"{e}. Please try again in a moment.")
 
 
 @app.delete("/documents/{doc_id}", dependencies=[Depends(require_key)])

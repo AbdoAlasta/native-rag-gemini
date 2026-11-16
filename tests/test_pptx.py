@@ -61,3 +61,13 @@ def test_native_upload_pptx_end_to_end(tmp_path, client):
     bad = client.post("/index/file", headers={"X-API-Key": "k"}, files={"file": ("old.ppt", b"x")},
                       data={"course_id": "c1", "source": "old.ppt"})
     assert bad.status_code == 415
+
+
+def test_broken_pptx_is_a_clear_error(tmp_path):
+    good = tmp_path / "good.pptx"
+    make_deck(str(good))
+    cases = {"text.pptx": b"just text with a .pptx name", "cut.pptx": good.read_bytes()[: good.stat().st_size // 2]}
+    for name, data in cases.items():
+        (tmp_path / name).write_bytes(data)
+        with pytest.raises(ValueError, match="could not be read as a PowerPoint"):
+            pptx_reader.slide_texts(str(tmp_path / name))

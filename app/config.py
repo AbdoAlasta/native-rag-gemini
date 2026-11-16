@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://rag:ragpass@localhost:5433/native_rag_gemini")
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # required; no default, so no credentials live in the code
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-2")
@@ -16,4 +16,15 @@ SERVICE_API_KEY = os.getenv("SERVICE_API_KEY", "")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 TOP_K = int(os.getenv("TOP_K", "8"))
+# Passages scoring below this cosine similarity are not given to the model (0 switches the cut-off off). Measured with
+# gemini-embedding-2 at 768 dims: course questions score 0.67-0.80, unrelated ones 0.54-0.58. Re-measure if the
+# embedding model or dimension changes.
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.60"))
 PRELOAD_EMBEDDING = os.getenv("PRELOAD_EMBEDDING", "1") == "1"
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "45"))  # seconds per answer-model request
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))  # extra tries after a 429 / 5xx / connection error
+MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "5000"))  # also the limit for each history entry
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+# Chat memory: the client sends a running summary plus recent exchanges. The follow-up rewrite only needs the last few.
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "1000"))
+REWRITE_TURNS = int(os.getenv("REWRITE_TURNS", "2"))

@@ -30,6 +30,7 @@ def client(monkeypatch):
     monkeypatch.setattr(config, "SERVICE_API_KEY", "k")
     monkeypatch.setattr(embedding, "embed_texts", fake_embed)
     monkeypatch.setattr(config, "PRELOAD_EMBEDDING", False)
+    monkeypatch.setattr(config, "MIN_SCORE", 0.0)  # fake word-count vectors score lower than Gemini; tests below set it
     monkeypatch.setattr(llm, "generate", lambda prompt: "Mitochondria produce ATP [1].")
     with TestClient(main.app) as c:
         with db.pool.connection() as conn:
@@ -160,3 +161,146 @@ def test_grouped_citations_are_marked_cited(client, monkeypatch):
     monkeypatch.setattr(llm, "generate", lambda prompt, system=None: "They make ATP [1, 2].")
     q = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1"}).json()
     assert [r["cited"] for r in q["references"][:2]] == [True, True]
+
+
+def test_off_topic_question_is_answered_without_a_model_call(client, monkeypatch):
+    from app import config, llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+    monkeypatch.setattr(config, "MIN_SCORE", 0.3)
+    calls = []
+    monkeypatch.setattr(llm, "generate", lambda prompt, system=None: calls.append(prompt) or "x [1].")
+    q = client.post("/query", headers=H, json={"question": "How do I bake chocolate cake?", "course_id": "c1"}).json()
+    assert calls == [] and q["references"] == [] and q["answer"].startswith("I could not find this")
+    q = client.post("/query", headers=H, json={"question": "ما هي عاصمة مصر؟", "course_id": "c1"}).json()
+    assert calls == [] and q["answer"].startswith("لم أجد")
+    q = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1"}).json()
+    assert len(calls) == 1 and q["references"][0]["source"] == "bio.txt"
+
+
+def test_actions_skip_the_cut_off_and_history_still_reaches_the_model(client, monkeypatch):
+    from app import config, llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+    monkeypatch.setattr(config, "MIN_SCORE", 0.3)
+    prompts = []
+
+    def fake_generate(prompt, system=None):
+        if system == llm.REWRITE_SYSTEM:
+            return "what did I ask before?"
+        prompts.append(prompt)
+        return "{}"
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    q = client.post("/query", headers=H, json={"question": "Make me a study plan", "course_id": "c1",
+                                               "instructions": "Respond with ONLY valid JSON"}).json()
+    assert len(prompts) == 1 and q["references"][0]["source"] == "bio.txt"  # generic action wording is not cut off
+    q = client.post("/query", headers=H, json={"question": "what did I ask before?", "course_id": "c1",
+        "history": [{"question": "What do mitochondria do?", "answer": "They produce ATP."}]}).json()
+    assert len(prompts) == 2 and q["references"] == []
+    assert "(No course passage matched this question.)" in prompts[-1] and "Q: What do mitochondria do?" in prompts[-1]
+
+
+def test_near_duplicate_passages_are_given_once(client):
+    up(client, "Software quality assurance checks that the process and product meet the standards.", source="ch1.txt")
+    up(client, "Software quality assurance checks that the process and product meet the standards today.",
+       source="recap.txt")
+    up(client, "Unit testing checks one software module on its own.", source="ch2.txt")
+    q = client.post("/query", headers=H, json={"question": "software quality assurance", "course_id": "c1"}).json()
+    assert [r["source"] for r in q["references"]] in (["ch1.txt", "ch2.txt"], ["recap.txt", "ch2.txt"])
+
+
+def test_request_limits(client, monkeypatch):
+    from app import config
+    assert client.post("/query", headers=H, json={"question": "", "course_id": "c1"}).status_code == 422
+    long = "x" * (config.MAX_QUESTION_CHARS + 1)
+    assert client.post("/query", headers=H, json={"question": long, "course_id": "c1"}).status_code == 422
+    turn = {"question": "a", "answer": long}
+    assert client.post("/query", headers=H, json={"question": "q", "course_id": "c1", "history": [turn]}).status_code == 422
+    monkeypatch.setattr(config, "MAX_UPLOAD_MB", 1)
+    r = up(client, "a" * (1024 * 1024 + 1))
+    assert r.status_code == 413 and client.get("/documents", headers=H, params={"course_id": "c1"}).json() == []
+    assert up(client, "small file").status_code == 200
+
+
+def test_model_failure_is_a_503(client, monkeypatch):
+    from app import llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+
+    def down(prompt, system=None):
+        raise llm.ModelUnavailable("Gemini answer failed: 503")
+    monkeypatch.setattr(llm, "generate", down)
+    r = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1"})
+    assert r.status_code == 503 and "try again" in r.json()["detail"]
+
+
+def test_summary_and_recent_turns_reach_the_model_and_the_rewrite_sees_only_the_last_two(client, monkeypatch):
+    from app import config, llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+    seen = {}
+
+    def fake_generate(prompt, system=None):
+        seen["rewrite" if system == llm.REWRITE_SYSTEM else "answer"] = prompt
+        return "Explain how mitochondria make ATP" if system == llm.REWRITE_SYSTEM else "ATP [1]."
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    monkeypatch.setattr(config, "REWRITE_TURNS", 2)
+    history = [{"question": f"q{i}", "answer": f"a{i}"} for i in range(1, 5)]
+    q = client.post("/query", headers=H, json={"question": "explain more", "course_id": "c1", "history": history,
+                                               "summary": "The student asked about cell organelles."}).json()
+    assert q["rewritten"] == "Explain how mitochondria make ATP"
+    assert "The student asked about cell organelles." in seen["rewrite"]
+    assert "Q: q3" in seen["rewrite"] and "Q: q4" in seen["rewrite"] and "Q: q2" not in seen["rewrite"]
+    answer = seen["answer"]
+    assert answer.startswith(llm.SUMMARY_LABEL + "\nThe student asked about cell organelles.")
+    assert all(f"Q: q{i}" in answer for i in range(1, 5))
+
+
+def test_a_summary_alone_still_lets_the_model_answer_about_the_chat(client, monkeypatch):
+    from app import config, llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+    monkeypatch.setattr(config, "MIN_SCORE", 0.3)
+    prompts = []
+
+    def fake_generate(prompt, system=None):
+        prompts.append((system, prompt))
+        return "what did I ask first?" if system == llm.REWRITE_SYSTEM else "You first asked about mitochondria."
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    q = client.post("/query", headers=H, json={"question": "what did I ask first?", "course_id": "c1",
+                                               "summary": "First the student asked what mitochondria do."}).json()
+    assert q["answer"] == "You first asked about mitochondria." and q["references"] == []
+    assert "First the student asked what mitochondria do." in prompts[-1][1]
+
+
+def test_summarize_endpoint(client, monkeypatch):
+    from app import config, llm
+    got = {}
+
+    def fake_generate(prompt, system=None):
+        got["prompt"], got["system"] = prompt, system
+        return "Updated summary: " + "s" * 5000
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    r = client.post("/summarize", headers=H, json={"summary": "Earlier: organelles.",
+                    "turns": [{"question": "What is ATP?", "answer": "Energy currency [1]."}]})
+    assert r.status_code == 200 and r.json()["summary"] == "s" * config.SUMMARY_MAX_CHARS
+    assert "Summary so far:\nEarlier: organelles." in got["prompt"] and "Q: What is ATP?" in got["prompt"]
+    assert got["system"].startswith("You keep a short running summary")
+    assert client.post("/summarize", headers=H, json={"summary": "", "turns": []}).status_code == 422
+    assert client.post("/summarize", json={"turns": [{"question": "a", "answer": "b"}]}).status_code == 401
+
+    def down(prompt, system=None):
+        raise llm.ModelUnavailable("Gemini answer failed: 429")
+    monkeypatch.setattr(llm, "generate", down)
+    r = client.post("/summarize", headers=H, json={"turns": [{"question": "a", "answer": "b"}]})
+    assert r.status_code == 503
+
+
+def test_broken_upload_is_a_422_with_a_reason(client):
+    r = up(client, "plain text saved as a pdf", source="fake.pdf")
+    assert r.status_code == 422 and "could not be read as a PDF" in r.json()["detail"]
+    r = up(client, "plain text saved as a pptx", source="fake.pptx")
+    assert r.status_code == 422 and "could not be read as a PowerPoint" in r.json()["detail"]
+
+
+def test_wrong_key_and_no_public_api_docs(client):
+    assert client.post("/query", headers={"X-API-Key": "kk"}, json={"question": "x", "course_id": "c1"}).status_code == 401
+    assert client.post("/query", headers={"X-API-Key": "é".encode("latin-1")}, json={"question": "x", "course_id": "c1"}).status_code == 401
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
+    assert client.get("/health").status_code == 200

@@ -22,20 +22,25 @@ def _shape_text(shape):
 
 def slide_texts(path):
     """[(slide_number, text)] for a .pptx: titles/text boxes/tables in reading order, then speaker notes.
-    Pictures are ignored (no OCR), so slides that are only images are skipped."""
-    prs = Presentation(path)
+    Pictures are ignored (no OCR), so slides that are only images are skipped. Raises ValueError (HTTP 422, final for
+    the Moodle indexer) for a damaged or password-protected file, or one without text."""
     slides = []
-    for i, slide in enumerate(prs.slides, start=1):
-        lines = []
-        for shape in slide.shapes:
-            lines += _shape_text(shape)
-        if slide.has_notes_slide:
-            notes = slide.notes_slide.notes_text_frame.text.strip() if slide.notes_slide.notes_text_frame else ""
-            if notes:
-                lines.append("Notes: " + notes)
-        text = "\n".join(lines).strip()
-        if text:
-            slides.append((i, text))
+    try:
+        prs = Presentation(path)
+        for i, slide in enumerate(prs.slides, start=1):
+            lines = []
+            for shape in slide.shapes:
+                lines += _shape_text(shape)
+            if slide.has_notes_slide:
+                notes = slide.notes_slide.notes_text_frame.text.strip() if slide.notes_slide.notes_text_frame else ""
+                if notes:
+                    lines.append("Notes: " + notes)
+            text = "\n".join(lines).strip()
+            if text:
+                slides.append((i, text))
+    except Exception as e:  # noqa: BLE001 - python-pptx / zipfile / lxml errors all mean "cannot read it"
+        raise ValueError("This file could not be read as a PowerPoint .pptx (damaged, password-protected, or not a "
+                         f"real .pptx): {type(e).__name__}") from e
     if not slides:
         raise ValueError("No extractable text found in this PowerPoint (only images?). OCR is not supported.")
     return slides

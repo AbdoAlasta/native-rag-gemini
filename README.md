@@ -18,13 +18,18 @@ It is the backend for two Moodle plugins:
 - **Answering** (`POST /query`): the question is embedded, the 8 nearest chunks **of that course only** are retrieved,
   and Gemini answers from them with `[n]` citations. With `history`, a follow-up like "explain more" is first rewritten
   into a standalone question.
+- **Chat memory**: a client sends the chat's running `summary` plus its last few exchanges. `POST /summarize` folds
+  older exchanges into that summary, so a long chat costs about the same as a short one.
+- **Guards**: questions whose best passage scores below `MIN_SCORE` get a "not found" reply without a model call;
+  near-duplicate passages are sent once; Gemini answer calls retry on 429/5xx and fail as HTTP 503.
 - Courses are isolated by a `course_id` filter inside the SQL query.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Status and embedding settings (no key needed) |
 | `POST /index/file` | Multipart: `file`, `course_id`, `source` (citation label), optional `doc_id` |
-| `POST /query` | JSON: `question`, `course_id`, optional `history`, `instructions` |
+| `POST /query` | JSON: `question`, `course_id`, optional `history`, `instructions`, `summary` |
+| `POST /summarize` | JSON: `summary`, `turns`. Folds older chat exchanges into a running summary (chat memory) |
 | `GET /documents?course_id=` | List indexed documents |
 | `DELETE /documents/{doc_id}?course_id=` | Remove a document |
 | `GET /stats` | Gemini call and token counters |

@@ -37,6 +37,9 @@ pool = None
 
 def init():
     global pool
+    if not config.DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set. Add it to .env (see .env.example), e.g. "
+                           "postgresql://USER:PASSWORD@localhost:5433/native_rag_gemini")
     with psycopg.connect(config.DATABASE_URL, autocommit=True) as conn:
         conn.execute(SCHEMA)
     pool = ConnectionPool(config.DATABASE_URL, min_size=1, max_size=5, configure=register_vector, open=True)

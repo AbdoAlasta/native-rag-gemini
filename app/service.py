@@ -16,6 +16,28 @@ def content_hash(pages):
     return h.hexdigest()
 
 
+_ARABIC = re.compile(r"[؀-ۿ]")
+
+
+def not_found_message(question):
+    if _ARABIC.search(question):
+        return "لم أجد هذا في مواد المقرر. جرّب صياغة السؤال بطريقة أخرى، أو اسأل عن موضوع يغطيه المقرر."
+    return "I could not find this in the course materials. Try rephrasing, or ask about a topic the course covers."
+
+
+def drop_near_duplicates(rows, threshold=0.8):
+    """rows come best first; a row whose words overlap an earlier kept row by >= threshold (Jaccard) is dropped, so
+    text repeated across pages (recaps, repeated slides) does not fill the context several times."""
+    kept, seen = [], []
+    for row in rows:
+        words = set(re.findall(r"\w+", row[3].lower()))
+        if any(len(words & s) / (len(words | s) or 1) >= threshold for s in seen):
+            continue
+        kept.append(row)
+        seen.append(words)
+    return kept
+
+
 def index_document(course_id, source, pages, doc_id=None):
     t0 = time.time()
     chash = content_hash(pages)
@@ -41,36 +63,59 @@ def index_document(course_id, source, pages, doc_id=None):
     }
 
 
-def answer(course_id, question, history=None, instructions=""):
-    """history = [(earlier_question, earlier_answer)], oldest first: when given, one small extra model call rewrites a
-    follow-up ("explain more") so it stands alone before searching. instructions (answer format, tone...) go to the
-    answer model only, never into the search. result['rewritten'] is the searched question when it differs."""
+def answer(course_id, question, history=None, instructions="", summary=""):
+    """history = [(earlier_question, earlier_answer)], oldest first, and summary = the older part of the chat in short:
+    when given, one small extra model call rewrites a follow-up ("explain more") so it stands alone before searching
+    (it only sees the summary and the last config.REWRITE_TURNS exchanges). instructions (answer format, tone...) go
+    to the answer model only, never into the search. result['rewritten'] is the searched question when it differs."""
     t0 = time.time()
+    history = history or []
+    summary = (summary or "").strip()
     searched = question
-    if history:
+    if history or summary:
         try:
-            searched = llm.rewrite_question(question, history) or question
+            recent = history[-config.REWRITE_TURNS:] if config.REWRITE_TURNS > 0 else []
+            searched = llm.rewrite_question(question, recent, summary) or question
         except Exception:  # the rewrite is a help, never a reason to fail: use the question as typed
             log.exception("could not rewrite the question")
     rewritten = searched if " ".join(searched.split()).lower() != " ".join(question.split()).lower() else None
-    qvec = embedding.embed_query(searched)
-    rows = db.search(course_id, qvec, config.TOP_K)
+    try:
+        qvec = embedding.embed_query(searched)
+    except Exception as e:  # noqa: BLE001 - reported to the caller as "try again", details in the log
+        log.exception("could not embed the question")
+        raise llm.ModelUnavailable("Gemini embedding failed") from e
+    rows = db.search(course_id, qvec, config.TOP_K * 2)  # extra candidates: some are dropped below
     if not rows:
         return {"answer": "No course materials are indexed for this course yet.", "references": [],
                 "rewritten": rewritten, "seconds": round(time.time() - t0, 2)}
+    rows = drop_near_duplicates(rows)
+    # Actions (quiz, study plan, topics...) carry instructions and ask about the course as a whole, so their generic
+    # wording scores low on purpose: the cut-off is only for questions.
+    if config.MIN_SCORE > 0 and not instructions.strip():
+        rows = [r for r in rows if r[4] >= config.MIN_SCORE]
+    rows = rows[:config.TOP_K]
+    if not rows and not history and not summary:  # nothing relevant: answer without spending a model call
+        return {"answer": not_found_message(question), "references": [], "rewritten": rewritten,
+                "seconds": round(time.time() - t0, 2)}
+    # With history but no relevant passage, the model still sees the conversation (for "what did I ask before?").
     context = "\n\n".join(
         f"[{i}] (source: {src}{', page ' + str(page) if page else ''})\n{content}"
         for i, (src, _doc, page, content, _score) in enumerate(rows, start=1)
-    )
+    ) or "(No course passage matched this question.)"
     prompt = f"Context passages:\n\n{context}\n\nQuestion: {searched}"
     if rewritten:
         prompt += f"\n(The student typed: {question})"
     if instructions.strip():
         prompt += f"\n\nInstructions for the answer: {instructions.strip()}"
-    if history:
+    if history or summary:
         # The conversation is given too, so questions about it ("what did I ask before?") can be answered.
-        turns = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in history)
-        prompt = f"Earlier conversation with this student (oldest first):\n\n{turns}\n\n{prompt}"
+        earlier = f"{llm.SUMMARY_LABEL}\n{summary}\n\n" if summary else ""
+        if history:
+            turns = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in history)
+            label = ("Most recent exchanges, after the summary (oldest first)" if summary
+                     else "Earlier conversation with this student (oldest first)")
+            earlier += f"{label}:\n\n{turns}\n\n"
+        prompt = earlier + prompt
         text = llm.generate(prompt, system=llm.SYSTEM + llm.CONVERSATION_RULE)
     else:
         text = llm.generate(prompt)
