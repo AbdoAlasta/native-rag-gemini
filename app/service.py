@@ -1,6 +1,7 @@
 """Core logic, independent of FastAPI so it is easy to test."""
 import hashlib
 import logging
+import random
 import re
 import time
 
@@ -19,10 +20,25 @@ def content_hash(pages):
 _ARABIC = re.compile(r"[؀-ۿ]")
 
 
+# Replies to off-topic questions (no model call), in a few wordings so the tutor does not repeat one sentence.
+NOT_FOUND = {
+    "en": [
+        "That one isn't covered in this course, so I can't answer it reliably. Try asking about a topic from the lectures.",
+        "I don't have anything on that in this course. If it's related to one of the lectures, try rephrasing it.",
+        "That's outside what this course covers. Ask me about something from the lectures and I'll help.",
+        "I couldn't find that topic in this course. Could you rephrase it, or ask about something from the lectures?",
+    ],
+    "ar": [
+        "هذا الموضوع غير مغطى في هذا المقرر، لذلك لا أستطيع الإجابة عنه بدقة. جرّب السؤال عن موضوع من المحاضرات.",
+        "لا يوجد لدي شيء عن هذا في هذا المقرر. إن كان مرتبطاً بإحدى المحاضرات، جرّب صياغته بطريقة أخرى.",
+        "هذا خارج ما يغطيه المقرر. اسألني عن أي موضوع من المحاضرات وسأساعدك.",
+        "لم أجد هذا الموضوع في المقرر. هل يمكنك إعادة صياغة سؤالك، أو السؤال عن شيء من المحاضرات؟",
+    ],
+}
+
+
 def not_found_message(question):
-    if _ARABIC.search(question):
-        return "لم أجد هذا في مواد المقرر. جرّب صياغة السؤال بطريقة أخرى، أو اسأل عن موضوع يغطيه المقرر."
-    return "I could not find this in the course materials. Try rephrasing, or ask about a topic the course covers."
+    return random.choice(NOT_FOUND["ar" if _ARABIC.search(question) else "en"])
 
 
 def drop_near_duplicates(rows, threshold=0.8):

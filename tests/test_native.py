@@ -164,21 +164,21 @@ def test_grouped_citations_are_marked_cited(client, monkeypatch):
 
 
 def test_off_topic_question_is_answered_without_a_model_call(client, monkeypatch):
-    from app import config, llm
+    from app import config, llm, service
     up(client, "Mitochondria are the organelles that produce ATP for the cell.")
     monkeypatch.setattr(config, "MIN_SCORE", 0.3)
     calls = []
     monkeypatch.setattr(llm, "generate", lambda prompt, system=None: calls.append(prompt) or "x [1].")
     q = client.post("/query", headers=H, json={"question": "How do I bake chocolate cake?", "course_id": "c1"}).json()
-    assert calls == [] and q["references"] == [] and q["answer"].startswith("I could not find this")
+    assert calls == [] and q["references"] == [] and q["answer"] in service.NOT_FOUND["en"]
     q = client.post("/query", headers=H, json={"question": "ما هي عاصمة مصر؟", "course_id": "c1"}).json()
-    assert calls == [] and q["answer"].startswith("لم أجد")
+    assert calls == [] and q["answer"] in service.NOT_FOUND["ar"]
     q = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1"}).json()
     assert len(calls) == 1 and q["references"][0]["source"] == "bio.txt"
 
 
 def test_style_reaches_the_model_but_keeps_the_cut_off(client, monkeypatch):
-    from app import config, embedding, llm
+    from app import config, embedding, llm, service
     up(client, "Mitochondria are the organelles that produce ATP for the cell.")
     monkeypatch.setattr(config, "MIN_SCORE", 0.3)
     searched, prompts = [], []
@@ -188,7 +188,7 @@ def test_style_reaches_the_model_but_keeps_the_cut_off(client, monkeypatch):
     style = "HINT MODE. This is hint 1 of 3."
     q = client.post("/query", headers=H, json={"question": "How do I bake chocolate cake?", "course_id": "c1",
                                                "style": style}).json()
-    assert prompts == [] and q["answer"].startswith("I could not find this")  # off-topic: still no model call
+    assert prompts == [] and q["answer"] in service.NOT_FOUND["en"]  # off-topic: still no model call
     q = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1",
                                                "style": style}).json()
     assert len(prompts) == 1 and prompts[0].endswith("Answer style: " + style)
