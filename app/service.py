@@ -63,11 +63,12 @@ def index_document(course_id, source, pages, doc_id=None):
     }
 
 
-def answer(course_id, question, history=None, instructions="", summary=""):
+def answer(course_id, question, history=None, instructions="", summary="", style=""):
     """history = [(earlier_question, earlier_answer)], oldest first, and summary = the older part of the chat in short:
     when given, one small extra model call rewrites a follow-up ("explain more") so it stands alone before searching
     (it only sees the summary and the last config.REWRITE_TURNS exchanges). instructions (answer format, tone...) go
-    to the answer model only, never into the search. result['rewritten'] is the searched question when it differs."""
+    to the answer model only, never into the search. style (hint mode...) goes to the answer model too but, unlike
+    instructions, keeps the relevance cut-off, because it comes with real questions. result['rewritten'] is the searched question when it differs."""
     t0 = time.time()
     history = history or []
     summary = (summary or "").strip()
@@ -107,6 +108,8 @@ def answer(course_id, question, history=None, instructions="", summary=""):
         prompt += f"\n(The student typed: {question})"
     if instructions.strip():
         prompt += f"\n\nInstructions for the answer: {instructions.strip()}"
+    if (style or "").strip():
+        prompt += f"\n\nAnswer style: {style.strip()}"
     if history or summary:
         # The conversation is given too, so questions about it ("what did I ask before?") can be answered.
         earlier = f"{llm.SUMMARY_LABEL}\n{summary}\n\n" if summary else ""

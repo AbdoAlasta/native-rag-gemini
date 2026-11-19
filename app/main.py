@@ -58,6 +58,8 @@ class AskRequest(BaseModel):
     history: list[Turn] = Field(default=[], max_length=10)  # earlier exchanges, oldest first (follow-up questions)
     instructions: str = Field(default="", max_length=4000)  # answer format/tone, not used for the search
     summary: str = Field(default="", max_length=2 * config.SUMMARY_MAX_CHARS)  # older part of the chat, from /summarize
+    # How to answer (hint mode, tone): sent to the model, not searched, and unlike instructions it keeps the cut-off.
+    style: str = Field(default="", max_length=2000)
 
 
 class SummarizeRequest(BaseModel):
@@ -108,7 +110,8 @@ def index_file(
 def query(req: AskRequest):
     history = [(t.question, t.answer) for t in req.history]
     try:
-        return service.answer(req.course_id, req.question, history, req.instructions, req.summary)
+        return service.answer(req.course_id, req.question, history, req.instructions, req.summary,
+                              style=req.style)
     except llm.ModelUnavailable as e:
         raise HTTPException(503, f"{e}. Please try again in a moment.")
 

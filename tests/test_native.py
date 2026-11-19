@@ -177,6 +177,24 @@ def test_off_topic_question_is_answered_without_a_model_call(client, monkeypatch
     assert len(calls) == 1 and q["references"][0]["source"] == "bio.txt"
 
 
+def test_style_reaches_the_model_but_keeps_the_cut_off(client, monkeypatch):
+    from app import config, embedding, llm
+    up(client, "Mitochondria are the organelles that produce ATP for the cell.")
+    monkeypatch.setattr(config, "MIN_SCORE", 0.3)
+    searched, prompts = [], []
+    real_embed_query = embedding.embed_query
+    monkeypatch.setattr(embedding, "embed_query", lambda text: searched.append(text) or real_embed_query(text))
+    monkeypatch.setattr(llm, "generate", lambda prompt, system=None: prompts.append(prompt) or "A hint [1].")
+    style = "HINT MODE. This is hint 1 of 3."
+    q = client.post("/query", headers=H, json={"question": "How do I bake chocolate cake?", "course_id": "c1",
+                                               "style": style}).json()
+    assert prompts == [] and q["answer"].startswith("I could not find this")  # off-topic: still no model call
+    q = client.post("/query", headers=H, json={"question": "Mitochondria produce ATP", "course_id": "c1",
+                                               "style": style}).json()
+    assert len(prompts) == 1 and prompts[0].endswith("Answer style: " + style)
+    assert all("HINT" not in s for s in searched)  # the style is never searched
+
+
 def test_actions_skip_the_cut_off_and_history_still_reaches_the_model(client, monkeypatch):
     from app import config, llm
     up(client, "Mitochondria are the organelles that produce ATP for the cell.")
